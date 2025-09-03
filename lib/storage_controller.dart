@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -26,6 +27,8 @@ class StorageController {
       await prefs.setDouble(key, value);
     } else if (value is List<String>) {
       await prefs.setStringList(key, value);
+    } else if (value is Map<String, dynamic>) {
+      await prefs.setString(key, jsonEncode(value));
     } else {
       throw ArgumentError("Unsupported type for SharedPreferences");
     }
@@ -37,7 +40,20 @@ class StorageController {
     if (!prefs.containsKey(key)) {
       return null;
     }
-    return prefs.get(key);
+    
+    final value = prefs.get(key);
+    
+    // Try to decode JSON if it's a string that looks like JSON
+    if (value is String && (value.startsWith('{') || value.startsWith('['))) {
+      try {
+        return jsonDecode(value);
+      } catch (e) {
+        // If JSON decode fails, return the original string
+        return value;
+      }
+    }
+    
+    return value;
   }
 
   Future<void> removeData(dynamic key) async {

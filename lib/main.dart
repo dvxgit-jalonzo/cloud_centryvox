@@ -1,36 +1,224 @@
-import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'dart:io';
 
-void main() {
-  runApp(const MyApp());
+import 'package:cloud_centryvox/api_controller.dart';
+import 'package:cloud_centryvox/call_handler_service.dart';
+import 'package:cloud_centryvox/firebase_service.dart';
+import 'package:cloud_centryvox/my_http_overrides.dart';
+import 'package:cloud_centryvox/navigation_service.dart';
+import 'package:cloud_centryvox/scan_qrcode_page.dart';
+import 'package:cloud_centryvox/storage_controller.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_callkit_incoming/entities/entities.dart';
+import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
+import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize Firebase
+  await Firebase.initializeApp();
+
+  // Set background message handler
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+
+  final storage = StorageController();
+  final isQrScanned = await storage.getData('is_qr_scanned') ?? false;
+
+  // Request basic permissions
+  if (kDebugMode) print('📱 Requesting permissions...');
+  await [
+    Permission.microphone,
+    Permission.camera,
+    Permission.systemAlertWindow,
+    Permission.ignoreBatteryOptimizations,
+    Permission.phone,
+  ].request();
+
+  // Request CallKit notification permissions
+  try {
+    await FlutterCallkitIncoming.requestNotificationPermission({
+      "rationaleMessagePermission":
+          "Notification permission is required to show incoming calls.",
+      "postNotificationMessageRequired":
+          "Please allow notification permission from settings.",
+    });
+    if (kDebugMode) print('✅ CallKit notification permission requested');
+  } catch (e) {
+    if (kDebugMode)
+      print('❌ Failed to request CallKit notification permission: $e');
+  }
+
+  HttpOverrides.global = MyHttpOverrides();
+
+  // Initialize Firebase Service
+  await FirebaseService().initialize();
+
+  // Re-register FCM token with backend after reboot/force stop
+  await _ensureFCMTokenRegistered();
+
+  // Initialize Call Handler Service
+  CallHandlerService().initialize();
+
+  // Handle any CallKit events that occurred while app was terminated
+  await _handleTerminatedCallKitEvents();
+
+  if (!isQrScanned) {
+    runApp(ScanQrCodePage());
+  } else {
+    runApp(const Main());
+  }
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+/// Ensure FCM token is properly registered with backend after reboot
+Future<void> _ensureFCMTokenRegistered() async {
+  try {
+    if (kDebugMode)
+      print('🔄 Ensuring FCM token is registered with backend...');
 
-  // This widget is the root of your application.
+    final storage = StorageController();
+
+    // Get current FCM token
+    final currentToken = await FirebaseMessaging.instance.getToken();
+    if (currentToken == null) {
+      if (kDebugMode) print('❌ No FCM token available');
+      return;
+    }
+
+    // Get stored token
+    final storedToken = await storage.getData('fcm_token');
+
+    // Check if we need to re-register (token changed or first time)
+    if (storedToken != currentToken) {
+      if (kDebugMode) print('🔄 FCM token changed, re-registering...');
+      await storage.storeData('fcm_token', currentToken);
+    } else {
+      if (kDebugMode)
+        print('📱 FCM token unchanged, but re-registering after reboot...');
+    }
+
+    // Always re-register token with backend after app start
+    // (in case server lost the token or it became invalid)
+    if (kDebugMode) print('🚀 Calling populateExtensionToken...');
+
+    final apiController = ApiController();
+    await apiController.populateExtensionToken();
+
+    if (kDebugMode) print('✅ FCM token re-registered successfully');
+  } catch (e) {
+    if (kDebugMode) print('❌ Failed to ensure FCM token registration: $e');
+    // Don't throw - app should continue to work even if token registration fails
+  }
+}
+
+/// Handle CallKit events that occurred while app was terminated
+Future<void> _handleTerminatedCallKitEvents() async {
+  try {
+    if (kDebugMode) print('🔍 Checking for terminated CallKit events...');
+
+    // Check for any active calls that might have been interacted with
+    final activeCalls = await FlutterCallkitIncoming.activeCalls();
+
+    for (var call in activeCalls) {
+      if (kDebugMode) print('📞 Found active call on startup: $call');
+
+      // You can add additional logic here to handle specific call states
+      // The CallHandlerService.checkPendingCalls() will also handle these
+    }
+
+    // Listen for the first event after app launch to catch missed events
+    FlutterCallkitIncoming.onEvent.take(1).listen((event) async {
+      if (event?.event == Event.actionCallAccept ||
+          event?.event == Event.actionCallStart) {
+        if (kDebugMode) print('📞 Caught missed accept event on app launch');
+        // This will be handled by the regular CallHandlerService listener
+      }
+    });
+  } catch (e) {
+    if (kDebugMode) print('❌ Error handling terminated CallKit events: $e');
+  }
+}
+
+class Main extends StatefulWidget {
+  const Main({super.key});
+
+  @override
+  State<Main> createState() => _MainState();
+}
+
+class _MainState extends State<Main> {
+  @override
+  void initState() {
+    super.initState();
+    // Check for pending calls when app starts
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      CallHandlerService().checkPendingCalls();
+
+      // Check if app was opened due to CallKit action
+      await _checkCallKitLaunch();
+    });
+  }
+
+  /// Check if app was launched due to CallKit interaction
+  Future<void> _checkCallKitLaunch() async {
+    try {
+      final storage = StorageController();
+
+      // Check if we have pending call data (means FCM call was received)
+      final pendingCallData = await storage.getData('pending_call_data');
+      if (pendingCallData != null) {
+        if (kDebugMode) {
+          print(
+            '🚀 App launched with pending call data - likely from CallKit Accept',
+          );
+        }
+
+        // If app launched and we have pending call data, assume user accepted
+        // (pressing decline usually doesn't launch the app)
+        final timestamp = pendingCallData['timestamp'] ?? 0;
+        final now = DateTime.now().millisecondsSinceEpoch;
+
+        // If call data is recent (within 2 minutes), assume accepted
+        if (now - timestamp < 120000) {
+          if (kDebugMode)
+            print('✅ Recent pending call + app launch = ACCEPTED');
+
+          // Trigger the call handler to process acceptance
+          CallHandlerService().handleCallAccept({
+            'id': pendingCallData['call_id'],
+            'call_id': pendingCallData['call_id'],
+          });
+        }
+      }
+
+      // Also check active calls
+      final activeCalls = await FlutterCallkitIncoming.activeCalls();
+      if (activeCalls.isNotEmpty) {
+        if (kDebugMode) {
+          print(
+            '📞 App launched with ${activeCalls.length} active CallKit calls',
+          );
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) print('❌ Error checking CallKit launch: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      debugShowCheckedModeBanner: false,
+      title: 'CentVox',
+      navigatorKey: NavigationService.navigatorKey,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const MyHomePage(title: 'CentVox'),
     );
   }
 }
@@ -54,69 +242,94 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
-
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
         title: Text(widget.title),
       ),
       body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
           mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+          children: [
+            ElevatedButton(
+              onPressed: () async {
+                final StorageController storage = StorageController();
+                final base = await storage.getData("base");
+                final accessToken = await storage.getData("accessToken");
+                final headers = {
+                  'Authorization': 'Bearer $accessToken',
+                  'Accept': 'application/json',
+                  'Content-Type': 'application/json',
+                };
+                final route = "$base/api/mobile-call-session/1756278668.365";
+                final extensionNumber = await storage.getData(
+                  "extensionNumber",
+                );
+                final response = await http.put(
+                  Uri.parse(route),
+                  headers: headers,
+                  body: jsonEncode({
+                    'status': "ready",
+                    'extension': extensionNumber,
+                    'action':
+                        "ready", // 'accept', 'decline', 'hangup', or 'accept_ready'
+                    'timestamp': DateTime.now().millisecondsSinceEpoch,
+                  }),
+                );
+                if (response.statusCode == 200) {
+                  if (kDebugMode)
+                    print('✅ Call response (ready) sent successfully');
+                } else {
+                  if (kDebugMode) {
+                    print(
+                      '❌ Failed to send call response: ${response.statusCode}',
+                    );
+                  }
+                }
+              },
+              child: Text("test"),
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () async {
+                // Test CallKit directly
+                if (kDebugMode) print('🧪 Testing CallKit directly...');
+                try {
+                  await FlutterCallkitIncoming.showCallkitIncoming(
+                    CallKitParams(
+                      id: "test-call-123",
+                      nameCaller: "Test Caller",
+                      appName: 'CentVox',
+                      handle: "+1234567890",
+                      type: 0,
+                      textAccept: 'Accept',
+                      textDecline: 'Decline',
+                      duration: 30000,
+                      android: const AndroidParams(
+                        isCustomNotification: false,
+                        isShowFullLockedScreen: true,
+                        backgroundColor: '#075E54',
+                        actionColor: '#4CAF50',
+                        isShowCallID: false,
+                      ),
+                      ios: IOSParams(iconName: 'CallKitLogo', ringtonePath: ''),
+                    ),
+                  );
+                  if (kDebugMode) {
+                    print('✅ Test CallKit triggered successfully!');
+                  }
+                } catch (e) {
+                  if (kDebugMode) print('❌ Test CallKit failed: $e');
+                }
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              child: Text("Test CallKit"),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }

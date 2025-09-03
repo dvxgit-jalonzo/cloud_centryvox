@@ -15,6 +15,8 @@ class OngoingCallPage extends StatefulWidget {
 class _OngoingCallPageState extends State<OngoingCallPage> {
   MicrophoneState micState = MicrophoneState.unmuted;
   SpeakerState speakerState = SpeakerState.earpiece;
+  String callerName = 'Unknown';
+  String callerNumber = '';
 
   final List<String> _dialpadKeys = const [
     '1',
@@ -35,6 +37,7 @@ class _OngoingCallPageState extends State<OngoingCallPage> {
   void initState() {
     super.initState();
     _setInitialSpeakerMode();
+    _loadCallerInfo();
   }
 
   Future<void> _setInitialSpeakerMode() async {
@@ -42,9 +45,25 @@ class _OngoingCallPageState extends State<OngoingCallPage> {
     setState(() => speakerState = SpeakerState.earpiece);
   }
 
+  Future<void> _loadCallerInfo() async {
+    try {
+      final pushData = await JanusService().storage.getData('push_notification_data');
+      if (pushData != null) {
+        setState(() {
+          callerName = pushData['caller_name'] ?? 'Unknown Caller';
+          callerNumber = pushData['caller_number'] ?? '';
+        });
+      }
+    } catch (e) {
+      print('Error loading caller info: $e');
+    }
+  }
+
   void _onButtonPressed(String value) {
     if (value == "hangup") {
       JanusService().hangup();
+      // Navigate back to main screen
+      Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false);
     } else {
       JanusService().sendDtmf(value);
     }
@@ -70,6 +89,71 @@ class _OngoingCallPageState extends State<OngoingCallPage> {
           ),
           child: Column(
             children: [
+              // Caller Information
+              Container(
+                padding: const EdgeInsets.all(20),
+                margin: const EdgeInsets.only(bottom: 20),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(15),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.grey.withOpacity(0.3),
+                      spreadRadius: 2,
+                      blurRadius: 5,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    CircleAvatar(
+                      radius: 40,
+                      backgroundColor: Colors.green,
+                      child: Icon(
+                        Icons.person,
+                        size: 50,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 15),
+                    Text(
+                      callerName,
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.black87,
+                      ),
+                    ),
+                    if (callerNumber.isNotEmpty) ...[
+                      const SizedBox(height: 5),
+                      Text(
+                        callerNumber,
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: Colors.grey[600],
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.green,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        'Connected',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
               const Spacer(),
               // Dial Pad Grid
               GridView.builder(

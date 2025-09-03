@@ -36,13 +36,9 @@ class JanusService {
   String? extensionNumber;
   final String password = "2241";
 
-  bool headless = false;
-
   /// Initialize Janus client + SIP plugin
   @pragma('vm:entry-point')
-  Future<void> initialize({bool headless = false}) async {
-    this.headless = headless;
-
+  Future<void> initialize() async {
     androidHost = await storage.getData("androidHost");
     extensionNumber = await storage.getData("extensionNumber");
 
@@ -60,6 +56,11 @@ class JanusService {
           RTCIceServer(urls: "stun:stun.l.google.com"),
           RTCIceServer(urls: "stun:stun2.l.google.com"),
           RTCIceServer(urls: "stun:stun3.l.google.com"),
+          RTCIceServer(
+            urls: "turn:122.3.188.98?transport=udp",
+            username: "diavox",
+            credential: "diavox",
+          ),
         ],
         isUnifiedPlan: true,
       );
@@ -72,37 +73,119 @@ class JanusService {
       earpieceMode();
 
       janusSipPlugin?.typedMessages?.listen(_handleSipEvent);
+
+      // Set up CallKit event listener for real calls
+      _setupCallKitEventListener();
+
+      if (kDebugMode) print("✅ Janus initialized successfully");
     } catch (e, stack) {
       if (kDebugMode) print("❌ Janus init error: $e\n$stack");
+      rethrow;
     }
   }
 
   void _handleSipEvent(event) async {
+    if (kDebugMode)
+      print(
+        "📡 SIP Event received: ${event.event.plugindata?.data.runtimeType}",
+      );
+
     final data = event.event.plugindata?.data;
-    if (data is SipRegisteredEvent && !headless) {
+    if (data is SipRegisteredEvent) {
+      if (kDebugMode) print("✅ SIP Registered Event");
       Fluttertoast.showToast(msg: "SIP Registered");
     } else if (data is SipIncomingCallEvent) {
+      if (kDebugMode)
+        print(
+          "📞 SIP Incoming Call Event - CRITICAL: This should trigger CallKit UI",
+        );
       await janusSipPlugin?.initializeWebRTCStack();
       rtc = event.jsep;
-      if (!headless) {
-        showCallkitIncoming();
-      } else {
-        if (kDebugMode)
-          print("Incoming call (headless): ${data.result?.displayname}");
-      }
+
+      if (kDebugMode) print("🚀 About to call showCallkitIncoming()...");
+      await showCallkitIncoming();
+      if (kDebugMode) print("✅ showCallkitIncoming() completed");
     } else if (data is SipAcceptedEvent) {
+      if (kDebugMode) print("✅ SIP Accepted Event");
       await janusSipPlugin?.handleRemoteJsep(event.jsep);
-      if (!headless) NavigationService.navigateTo(const OngoingCallPage());
+      NavigationService.navigateTo(const OngoingCallPage());
     } else if (data is SipHangupEvent) {
+      if (kDebugMode) print("📞 SIP Hangup Event");
       earpieceMode();
-      if (!headless) NavigationService.removePageByName('/OngoingCallPage');
+      NavigationService.removePageByName('/OngoingCallPage');
     } else if (kDebugMode) {
       print("❌ Unhandled SIP event: $data");
     }
   }
 
+  /// Set up CallKit event listener for real incoming calls from Janus
+  void _setupCallKitEventListener() {
+    FlutterCallkitIncoming.onEvent.listen((CallEvent? event) async {
+      if (event == null) return;
+
+      if (kDebugMode) print('📞 CallKit Event from Janus: ${event.event}');
+
+      switch (event.event) {
+        case Event.actionCallAccept:
+        case Event.actionCallStart:
+          if (kDebugMode) print('✅ Real call accepted from Janus');
+          await _handleRealCallAccept();
+          break;
+
+        case Event.actionCallDecline:
+          if (kDebugMode) print('❌ Real call declined from Janus');
+          await _handleRealCallDecline();
+          break;
+
+        case Event.actionCallEnded:
+          if (kDebugMode) print('📞 Real call ended from Janus');
+          await _handleRealCallEnd();
+          break;
+
+        default:
+          if (kDebugMode) print('🤔 Unhandled CallKit event: ${event.event}');
+      }
+    });
+  }
+
+  /// Handle real call acceptance from CallKit
+  Future<void> _handleRealCallAccept() async {
+    try {
+      if (kDebugMode) print('🎯 Accepting real call via Janus SIP...');
+      await accept(); // Use existing Janus accept method
+      if (kDebugMode) print('✅ Real call accepted successfully');
+    } catch (e) {
+      if (kDebugMode) print('❌ Error accepting real call: $e');
+    }
+  }
+
+  /// Handle real call decline from CallKit
+  Future<void> _handleRealCallDecline() async {
+    try {
+      if (kDebugMode) print('🎯 Declining real call via Janus SIP...');
+      await decline(); // Use existing Janus decline method
+      await FlutterCallkitIncoming.endAllCalls();
+      if (kDebugMode) print('✅ Real call declined successfully');
+    } catch (e) {
+      if (kDebugMode) print('❌ Error declining real call: $e');
+    }
+  }
+
+  /// Handle real call end from CallKit
+  Future<void> _handleRealCallEnd() async {
+    try {
+      if (kDebugMode) print('🎯 Ending real call via Janus SIP...');
+      await hangup(); // Use existing Janus hangup method
+      if (kDebugMode) print('✅ Real call ended successfully');
+    } catch (e) {
+      if (kDebugMode) print('❌ Error ending real call: $e');
+    }
+  }
+
   /// SIP Register
   Future<void> register({bool sendRegister = true}) async {
+    if (kDebugMode) print('📞 SIP REGISTER: Registering with sip:$extensionNumber@$androidHost');
+    
     await janusSipPlugin?.register(
       "sip:$extensionNumber@$androidHost",
       forceUdp: true,
@@ -112,6 +195,8 @@ class JanusService {
       proxy: "sip:$androidHost",
       secret: password,
     );
+    
+    if (kDebugMode) print('📞 SIP REGISTER: Registration request sent - waiting for events...');
   }
 
   /// Call a SIP number
@@ -217,39 +302,74 @@ class JanusService {
 
   /// Initialize local media stream
   Future<void> _initializeLocalStream() async {
-    MediaStream? temp = await janusSipPlugin?.initializeMediaDevices(
+    await janusSipPlugin?.initializeMediaDevices(
       mediaConstraints: {'audio': true, 'video': false},
     );
   }
 
-  /// Show CallKit incoming call UI
+  /// Show CallKit incoming call UI for real calls
   @pragma('vm:entry-point')
   Future<void> showCallkitIncoming() async {
-    await FlutterCallkitIncoming.showCallkitIncoming(
-      CallKitParams(
-        id: const Uuid().v4(),
-        nameCaller: "Incoming Call",
-        appName: 'CentVox',
-        avatar: 'assets/images/icon/call_image.png',
-        handle: 'SIP Call',
-        type: 0,
-        textAccept: 'Accept',
-        textDecline: 'Decline',
-        extra: <String, dynamic>{'caller': "SIP Caller"},
-        android: const AndroidParams(
-          isCustomNotification: true,
-          isShowLogo: true,
-          isShowFullLockedScreen: true,
-          ringtonePath: 'system_ringtone_default',
-          backgroundColor: '#075E54',
-          actionColor: '#4CAF50',
-          isShowCallID: false,
+    try {
+      if (kDebugMode) print('🔥 ENTERING showCallkitIncoming() function');
+
+      // Get caller info from stored push notification data
+      final pushData = await storage.getData('push_notification_data');
+      final callerName = pushData?['caller_name'] ?? 'Test Caller';
+      final callerNumber = pushData?['caller_number'] ?? '+1234567890';
+
+      if (kDebugMode)
+        print('📞 CallKit Data: Name=$callerName, Number=$callerNumber');
+      if (kDebugMode) print('📦 Push data available: ${pushData != null}');
+
+      // First try to end any existing calls to ensure clean state
+      if (kDebugMode) print('🧹 Ending existing calls...');
+      await FlutterCallkitIncoming.endAllCalls();
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      if (kDebugMode)
+        print('🚀 CALLING FlutterCallkitIncoming.showCallkitIncoming...');
+
+      // Try a very simple CallKit call first
+      await FlutterCallkitIncoming.showCallkitIncoming(
+        CallKitParams(
+          id: const Uuid().v4(),
+          nameCaller: callerName,
+          appName: 'CentVox',
+          avatar: 'assets/images/icon/call_image.png',
+          handle: callerNumber,
+          type: 0,
+          textAccept: 'Accept',
+          textDecline: 'Decline',
+          duration: 30000,
+          headers: <String, dynamic>{'platform': 'flutter'},
+          extra: <String, dynamic>{
+            'caller': callerName,
+            'caller_number': callerNumber,
+            'is_real_call': true,
+          },
+          android: const AndroidParams(
+            isCustomNotification: false,
+            isShowFullLockedScreen: true,
+            ringtonePath: '',
+            backgroundColor: '#075E54',
+            actionColor: '#4CAF50',
+            isShowCallID: false,
+          ),
+          ios: IOSParams(iconName: 'CallKitLogo', ringtonePath: ''),
         ),
-        ios: IOSParams(
-          iconName: 'CallKitLogo',
-          ringtonePath: 'system_ringtone_default',
-        ),
-      ),
-    );
+      );
+
+      if (kDebugMode)
+        print(
+          '✅ FlutterCallkitIncoming.showCallkitIncoming completed successfully!',
+        );
+    } catch (e, stackTrace) {
+      if (kDebugMode) {
+        print('❌ CRITICAL ERROR in showCallkitIncoming: $e');
+        print('📍 Stack trace: $stackTrace');
+      }
+      rethrow;
+    }
   }
 }

@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "653540636805",
+    "project_id": "centryvox-firebase",
+    "storage_bucket": "centryvox-firebase.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:653540636805:android:eca444951b52f3695b91ec",
+        "android_client_info": {
+          "package_name": "net.diavox.cloud_centryvox"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBKzZ02-TA1XzkJSVNHcd52FFUOC8ttRqU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
